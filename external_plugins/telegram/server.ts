@@ -157,10 +157,16 @@ function pruneExpiredInbox(): number {
         `telegram channel: ${expired} queued message(s) expired undelivered (>${INBOX_TTL_SECONDS / 3600}h old)\n`
       )
     }
-    // Delete delivered/expired rows older than 7 days to keep the DB lean.
+    // Delete old rows to keep the DB lean:
+    //   delivered → key off delivered_at (kept for 7 days after actual delivery)
+    //   expired   → key off created_at   (never delivered, count from enqueue time)
+    const cleanCutoff = now - 7 * 24 * 60 * 60
     db.prepare(
-      `DELETE FROM inbox WHERE status IN ('delivered', 'expired') AND created_at < ?`
-    ).run(now - 7 * 24 * 60 * 60)
+      `DELETE FROM inbox WHERE status = 'delivered' AND delivered_at < ?`
+    ).run(cleanCutoff)
+    db.prepare(
+      `DELETE FROM inbox WHERE status = 'expired' AND created_at < ?`
+    ).run(cleanCutoff)
     return expired
   } catch (err) {
     process.stderr.write(`telegram channel: prune error: ${err}\n`)
@@ -816,8 +822,12 @@ await mcp.connect(new StdioServerTransport())
 
 // Drain any messages that arrived while no Claude session was active.
 // mcp.connect() completes the MCP init handshake — notifications are live here.
-// We drain before bot.start() so the bot isn't polling yet, keeping the
-// startup sequence deterministic.
+//
+// Intentionally NOT awaited: each row requires an mcp.notification() round-trip,
+// so awaiting could block bot startup for a non-trivial time if many messages are
+// queued. Running concurrently is safe — _draining prevents a second drain_pending_
+// messages tool call from overlapping, and the bot hasn't started polling yet so no
+// new inbound messages can arrive until bot.start() returns below.
 autodrainInbox().catch(err => {
   process.stderr.write(`telegram channel: startup drain failed: ${err}\n`)
 })
