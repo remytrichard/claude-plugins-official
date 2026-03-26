@@ -30,7 +30,11 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DB_PATH = join(STATE_DIR, 'inbox.db')
 // Messages expire after 24 h if never drained (session was never active long enough).
-const INBOX_TTL_SECONDS = 24 * 60 * 60
+// Note: this means messages sent while a session is offline for >24h will not be
+// delivered. Increase INBOX_TTL_SECONDS via env var if longer retention is needed.
+const INBOX_TTL_SECONDS = Number(process.env.TELEGRAM_INBOX_TTL_SECONDS ?? 24 * 60 * 60)
+// Delivered/expired rows older than this are pruned from the DB (housekeeping only).
+const INBOX_CLEANUP_SECONDS = 7 * 24 * 60 * 60
 
 // Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -81,7 +85,9 @@ function getInboxDb(): Database {
   mkdirSync(STATE_DIR, { recursive: true })
   _db = new Database(INBOX_DB_PATH)
   // Restrict file to owner — belt-and-suspenders alongside STATE_DIR 0o700.
-  try { chmodSync(INBOX_DB_PATH, 0o600) } catch { /* ignore on first-open race */ }
+  try { chmodSync(INBOX_DB_PATH, 0o600) } catch (err) {
+    process.stderr.write(`telegram channel: could not restrict inbox.db permissions: ${err}\n`)
+  }
   _db.run('PRAGMA journal_mode=WAL')
   _db.run('PRAGMA busy_timeout = 3000')
   _db.run(`
@@ -121,14 +127,17 @@ type InboxParams = {
 function writeInbox(params: InboxParams): number | null {
   try {
     const db = getInboxDb()
-    const msgId = params.meta.message_id != null ? Number(params.meta.message_id) : null
+    const parsed = params.meta.message_id != null ? Number(params.meta.message_id) : null
+    const msgId = (parsed != null && Number.isFinite(parsed)) ? parsed : null
     const stmt = db.prepare(
       'INSERT INTO inbox (chat_id, message_id, params_json) VALUES (?, ?, ?)'
     )
     const result = stmt.run(params.meta.chat_id, msgId, JSON.stringify(params)) as { lastInsertRowid: number }
     return result.lastInsertRowid
   } catch (err) {
-    process.stderr.write(`telegram channel: failed to write inbox: ${err}\n`)
+    process.stderr.write(
+      `telegram channel: failed to write inbox (chat=${params.meta.chat_id} msg=${params.meta.message_id ?? 'none'}): ${err}\n`
+    )
     return null
   }
 }
@@ -160,7 +169,7 @@ function pruneExpiredInbox(): number {
     // Delete old rows to keep the DB lean:
     //   delivered → key off delivered_at (kept for 7 days after actual delivery)
     //   expired   → key off created_at   (never delivered, count from enqueue time)
-    const cleanCutoff = now - 7 * 24 * 60 * 60
+    const cleanCutoff = now - INBOX_CLEANUP_SECONDS
     db.prepare(
       `DELETE FROM inbox WHERE status = 'delivered' AND delivered_at < ?`
     ).run(cleanCutoff)
@@ -176,8 +185,8 @@ function pruneExpiredInbox(): number {
 
 let _draining = false
 
-async function autodrainInbox(): Promise<{ delivered: number; failed: number; expired: number }> {
-  if (_draining) return { delivered: 0, failed: 0, expired: 0 }
+async function autodrainInbox(): Promise<{ delivered: number; failed: number; expired: number; alreadyRunning?: true }> {
+  if (_draining) return { delivered: 0, failed: 0, expired: 0, alreadyRunning: true }
   _draining = true
   let delivered = 0
   let failed = 0
@@ -795,7 +804,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
       case 'drain_pending_messages': {
-        const { delivered, failed, expired } = await autodrainInbox()
+        const { delivered, failed, expired, alreadyRunning } = await autodrainInbox()
+        if (alreadyRunning) {
+          return { content: [{ type: 'text', text: 'drain already in progress (startup drain is running)' }] }
+        }
         const parts: string[] = []
         if (delivered > 0) parts.push(`${delivered} delivered`)
         if (failed > 0)    parts.push(`${failed} still pending`)
